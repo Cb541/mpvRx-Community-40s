@@ -1,0 +1,364 @@
+import com.android.build.api.variant.FilterConfiguration
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
+
+val localProperties =
+  Properties().apply {
+    val localFile = rootProject.file("local.properties")
+    if (localFile.exists()) {
+      localFile.inputStream().use { load(it) }
+    }
+  }
+
+val targetAbiProp = project.findProperty("targetAbi")?.toString() ?: localProperties.getProperty("targetAbi")
+val enableX86 = project.findProperty("enableX86") != "false"
+val x86Abis = if (enableX86) listOf("x86", "x86_64") else emptyList()
+val activeAbis =
+  if (!targetAbiProp.isNullOrBlank()) {
+    targetAbiProp.split(",").map { it.trim() }
+  } else {
+    listOf("arm64-v8a", "armeabi-v7a") + x86Abis
+  }
+val universalOnlyDistributions = setOf("noVulkan", "fongmi")
+val releaseVersionCode = 272
+val versionCodeBandSize = 10_000
+val stableVersionCode = releaseVersionCode * versionCodeBandSize + (versionCodeBandSize - 1)
+val previewVersionCode =
+  (releaseVersionCode + 1) * versionCodeBandSize +
+    (getCommitCount().toIntOrNull() ?: 1).coerceIn(1, versionCodeBandSize - 2)
+
+plugins {
+  alias(libs.plugins.android.application)
+  alias(libs.plugins.kotlin.compose.compiler)
+  alias(libs.plugins.kotlinx.serialization)
+  alias(libs.plugins.ksp)
+  alias(libs.plugins.room)
+  alias(libs.plugins.ktlint)
+}
+
+android {
+  namespace = "app.gyrolet.mpvrx"
+  compileSdk = 37
+  ndkVersion = "27.3.13750724"
+
+  defaultConfig {
+    applicationId = "app.gyrolet.mpvrx"
+    minSdk = 26
+    targetSdk = 36
+    // Stable occupies the top of its version band. Preview uses the next band's commit-count
+    // offset, so Stable -> Preview -> newer Preview -> next Stable is always an Android upgrade.
+    versionCode = stableVersionCode
+    versionName = "2.7.2"
+
+    vectorDrawables {
+      useSupportLibrary = true
+    }
+
+    buildConfigField("boolean", "SHARED_PLAYBACK_EXPERIMENT", "false")
+    buildConfigField("String", "GIT_SHA", "\"${getCommitSha()}\"")
+    buildConfigField("int", "GIT_COUNT", getCommitCount())
+
+    externalNativeBuild {
+      cmake {
+        abiFilters += activeAbis
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.22.1"
+    }
+  }
+
+  flavorDimensions += "distribution"
+
+  productFlavors {
+    create("standard") {
+      dimension = "distribution"
+      buildConfigField("boolean", "ENABLE_UPDATE_FEATURE", "true")
+      buildConfigField("String", "UPDATE_APK_VARIANT", "\"standard\"")
+      buildConfigField("boolean", "SCOPED_STORAGE_ONLY", "false")
+      buildConfigField("boolean", "MPV_SUPPORTS_VULKAN", "true")
+      buildConfigField("boolean", "MPV_SUPPORTS_MEDIACODEC_VULKAN", "false")
+    }
+
+    create("noVulkan") {
+      dimension = "distribution"
+      buildConfigField("boolean", "ENABLE_UPDATE_FEATURE", "true")
+      buildConfigField("String", "UPDATE_APK_VARIANT", "\"no-vulkan\"")
+      buildConfigField("boolean", "SCOPED_STORAGE_ONLY", "false")
+      buildConfigField("boolean", "MPV_SUPPORTS_VULKAN", "false")
+      buildConfigField("boolean", "MPV_SUPPORTS_MEDIACODEC_VULKAN", "false")
+    }
+
+    create("fongmi") {
+      dimension = "distribution"
+      buildConfigField("boolean", "ENABLE_UPDATE_FEATURE", "true")
+      buildConfigField("String", "UPDATE_APK_VARIANT", "\"fongmi\"")
+      buildConfigField("boolean", "SCOPED_STORAGE_ONLY", "false")
+      buildConfigField("boolean", "MPV_SUPPORTS_VULKAN", "true")
+      buildConfigField("boolean", "MPV_SUPPORTS_MEDIACODEC_VULKAN", "true")
+    }
+  }
+
+  dependenciesInfo {
+    includeInApk = false
+    includeInBundle = false
+  }
+
+  splits {
+    abi {
+      isEnable = true
+      reset()
+      include(*activeAbis.toTypedArray())
+      isUniversalApk = activeAbis.size > 1
+    }
+  }
+
+  buildTypes {
+    named("release") {
+      buildConfigField("boolean", "IS_PREVIEW_BUILD", "false")
+      isMinifyEnabled = true
+      isShrinkResources = true
+      proguardFiles(
+        getDefaultProguardFile("proguard-android-optimize.txt"),
+        "proguard-rules.pro",
+      )
+      ndk {
+        debugSymbolLevel = "none"
+      }
+    }
+
+    create("preview") {
+      initWith(getByName("release"))
+      signingConfig = signingConfigs.getByName("debug")
+      buildConfigField("boolean", "IS_PREVIEW_BUILD", "true")
+      versionNameSuffix = "-beta.r${getCommitCount()}"
+    }
+
+    named("debug") {
+      buildConfigField("boolean", "IS_PREVIEW_BUILD", "false")
+      buildConfigField("boolean", "SHARED_PLAYBACK_EXPERIMENT", "true")
+      applicationIdSuffix = ".sharedtest"
+      versionNameSuffix = "-${getCommitCount()}"
+      resValue("string", "app_name", "mpvRx Shared Cache Test")
+    }
+  }
+
+  compileOptions {
+    isCoreLibraryDesugaringEnabled = true
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+  }
+
+  buildFeatures {
+    compose = true
+    viewBinding = true
+    buildConfig = true
+    resValues = true
+  }
+
+  packaging {
+    resources {
+      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+      excludes += "META-INF/DEPENDENCIES"
+      excludes += "META-INF/LICENSE*"
+      excludes += "META-INF/NOTICE*"
+      excludes += "META-INF/*.kotlin_module"
+      excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+    }
+    jniLibs {
+      useLegacyPackaging = true
+      pickFirsts += "**/libc++_shared.so"
+    }
+  }
+
+  @Suppress("UnstableApiUsage")
+  androidResources {
+    generateLocaleConfig = true
+  }
+
+  lint {
+    checkReleaseBuilds = false
+    abortOnError = false
+  }
+}
+
+androidComponents {
+  val abiCodes =
+    mutableMapOf(
+      "armeabi-v7a" to 1,
+      "arm64-v8a" to 2,
+    )
+  if (enableX86) {
+    abiCodes["x86"] = 3
+    abiCodes["x86_64"] = 4
+  }
+
+  onVariants { variant ->
+    val isUniversalOnly =
+      variant.productFlavors.any { (dimension, flavor) ->
+        dimension == "distribution" && flavor in universalOnlyDistributions
+      }
+
+    variant.outputs.forEach { output ->
+      val abi =
+        output.filters
+          .find { it.filterType == FilterConfiguration.FilterType.ABI }
+          ?.identifier
+
+      if (isUniversalOnly && abi != null) {
+        output.enabled.set(false)
+      }
+
+      val channelVersionCode =
+        if (variant.buildType == "preview") previewVersionCode else (output.versionCode.orNull ?: stableVersionCode)
+      output.versionCode.set(channelVersionCode * 10 + (abiCodes[abi] ?: 0))
+    }
+  }
+}
+
+kotlin {
+  compilerOptions {
+    freeCompilerArgs.addAll(
+      "-opt-in=com.google.accompanist.permissions.ExperimentalPermissionsApi",
+      "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+      "-opt-in=androidx.compose.material3.ExperimentalMaterial3ExpressiveApi",
+    )
+    jvmTarget.set(JvmTarget.JVM_17)
+  }
+}
+
+composeCompiler {
+  includeSourceInformation = false
+}
+
+room {
+  schemaDirectory("$projectDir/schemas")
+}
+
+dependencies {
+  testImplementation("junit:junit:4.13.2")
+  implementation(libs.androidx.activity.compose)
+  implementation(platform(libs.androidx.compose.bom))
+  implementation(libs.androidx.ui)
+  implementation(libs.androidx.ui.graphics)
+  implementation(libs.androidx.material3.android)
+  implementation(libs.google.material)
+  implementation(libs.androidx.compose.material)
+  implementation(libs.androidx.ui.tooling.preview)
+  debugImplementation(libs.androidx.ui.tooling)
+  debugImplementation(libs.leakcanary.android)
+  implementation(libs.bundles.compose.navigation3)
+  implementation(libs.androidx.appcompat)
+  implementation(libs.androidx.core.ktx)
+  implementation(libs.crashx)
+  implementation(libs.kmp.vibrate)
+  implementation(libs.androidx.compose.constraintlayout)
+  implementation(libs.androidx.preference.ktx)
+  implementation(libs.androidx.constraintlayout)
+  implementation(libs.composables.material.symbols.rounded.filled.android)
+  implementation(libs.composables.material.symbols.rounded.filled.cmp)
+  implementation(libs.androidx.compose.animation.graphics)
+  implementation(libs.mediasession)
+  implementation(libs.androidx.documentfile)
+  implementation(libs.androidx.palette)
+
+  implementation(platform(libs.koin.bom))
+  implementation(libs.bundles.koin)
+
+  implementation(libs.seeker)
+  implementation(libs.compose.prefs)
+  implementation(libs.markdown.renderer.m3)
+
+  implementation(libs.accompanist.permissions)
+
+  implementation(libs.room.runtime)
+  ksp(libs.room.compiler)
+  implementation(libs.room.ktx)
+
+  implementation(libs.kotlinx.immutable.collections)
+  implementation(libs.kotlinx.serialization.json)
+  implementation(libs.okhttp)
+  implementation(libs.jsoup)
+  implementation(libs.androidx.media3.common)
+  implementation(libs.androidx.media3.effect)
+  implementation(libs.androidx.media3.transformer)
+  implementation(platform(libs.sora.editor.bom))
+  implementation(libs.sora.editor)
+  implementation(libs.sora.language.textmate)
+  // implementation(libs.sora.oniguruma.native)
+
+  coreLibraryDesugaring(libs.desugar.jdk.libs)
+
+  implementation(libs.truetype.parser)
+  implementation(libs.anitomy)
+  implementation(libs.fsaf)
+  implementation(libs.mediainfo.lib)
+  implementation(libs.androidx.profileinstaller)
+  implementation(libs.google.cast.framework)
+
+  // Optional locally rebuilt mpvlib with the persistent FFmpeg seek API.
+  // Without it, use the official AAR and the range-cache/legacy fallbacks.
+  val customSeekMpvlib = file("libs/mpvlib-seek-native.aar")
+  if (customSeekMpvlib.isFile) {
+    "standardImplementation"(files(customSeekMpvlib))
+  } else {
+    "standardImplementation"(variantOf(libs.mpvlib.standard) { artifactType("aar") })
+  }
+  "noVulkanImplementation"(variantOf(libs.mpvlib.no.vulkan) { artifactType("aar") })
+  "fongmiImplementation"(variantOf(libs.mpvlib.fongmi) { artifactType("aar") })
+
+  // Network protocol libraries
+  implementation(libs.smbj)
+  implementation(libs.commons.net)
+  implementation(libs.jsch)
+  implementation(libs.sardine.android) {
+    exclude(group = "xpp3", module = "xpp3")
+  }
+  implementation(libs.libarchive.android)
+  implementation(libs.nanohttpd)
+  implementation(libs.lazycolumnscrollbar)
+  implementation(libs.reorderable)
+  implementation(libs.androidx.biometric)
+  implementation(libs.telephoto.zoomable)
+  implementation(libs.backdrop)
+  implementation(libs.haze.blur)
+
+  // libtorrent4j's Java API plus the native library for every enabled APK ABI.
+  implementation(libs.libtorrent4j)
+  implementation(libs.libtorrent4j.android.arm64)
+  implementation(libs.libtorrent4j.android.arm)
+  if (enableX86) {
+    implementation(libs.libtorrent4j.android.x86)
+    implementation(libs.libtorrent4j.android.x8664)
+  }
+}
+
+// ---------------- Git helpers ----------------
+
+fun getCommitCount(): String = runCommand("git rev-list --count HEAD") ?: "0"
+
+fun getCommitSha(): String = runCommand("git rev-parse --short HEAD") ?: "unknown"
+
+fun runCommand(command: String): String? =
+  try {
+    val parts = command.split(' ')
+    val process =
+      ProcessBuilder(parts)
+        .redirectErrorStream(true)
+        .start()
+
+    val output =
+      process.inputStream
+        .bufferedReader()
+        .readText()
+        .trim()
+
+    val exitCode = process.waitFor()
+    if (exitCode == 0) output.ifEmpty { null } else null
+  } catch (e: Exception) {
+    null
+  }

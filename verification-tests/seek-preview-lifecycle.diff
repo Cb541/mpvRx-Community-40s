@@ -1,0 +1,156 @@
+--- a/app/src/main/java/app/gyrolet/mpvrx/domain/seekpreview/SeekPreviewStore.kt
++++ b/app/src/main/java/app/gyrolet/mpvrx/domain/seekpreview/SeekPreviewStore.kt
+@@ -72,6 +72,11 @@
+   @Volatile private var activeBridge: NetworkSeekHttpBridge? = null
+   private var lastSeekSignal = PlaybackSession.lastPlaybackSeekAtElapsedMs
+   private val seekEpoch = AtomicLong(0L)
++  // Only the foreground worker closes native contexts. Other threads set this
++  // bit and interrupt their I/O; freeing a decoder on a different thread while
++  // FFmpeg is inside av_read_frame is unsafe.
++  private val transportInvalidated = AtomicBoolean(false)
++  private val activeForegroundSlot = AtomicLong(-1L)
+   @Volatile private var decodingNeighbor = false
+   // Explicit upper bound on sidecar work while the user pauses and browses.
+   // No remote neighbor generation runs while the video is actually playing.
+@@ -91,10 +96,8 @@
+         val signal = PlaybackSession.lastPlaybackSeekAtElapsedMs
+         if (signal > lastSeekSignal) {
+           lastSeekSignal = signal
+-          seekEpoch.incrementAndGet()
+-          activeDecoder?.interruptPersistent()
+-          activeBridge?.cancelActivePreviewRequests()
+-          Log.d("SeekPreviewPerf", "playback-seek: thumbnail connection interrupted")
++          invalidateTransport(playbackSeek = true)
++          Log.d("SeekPreviewPerf", "playback-seek: thumbnail connection invalidated; will reopen after seek")
+         }
+       }
+     }
+@@ -103,6 +106,18 @@
+   private fun active(): Boolean = !closed.get() &&
+     PlaybackSession.isCurrentGeneration(generation) && SeekPreviewSessionDisk.isActive(generation)
+ 
++  /** Interrupt I/O immediately, but never release native handles off the
++   * foreground worker. A canceled NanoHTTPD bridge is permanently suspended,
++   * so the next preview MUST create a fresh instance (not reuse the old URL).
++   */
++  private fun invalidateTransport(playbackSeek: Boolean) {
++    seekEpoch.incrementAndGet()
++    transportInvalidated.set(true)
++    if (playbackSeek) activeDecoder?.interruptForPlaybackSeek()
++    else activeDecoder?.interruptPersistent()
++    activeBridge?.cancelActivePreviewRequests()
++  }
++
+   /** Called by the existing UI; no network is used here, on purpose. */
+   fun warmAround(positionSeconds: Float, durationSeconds: Float) = Unit
+ 
+@@ -147,10 +162,12 @@
+     }
+     // A new user target must never wait behind a speculative neighbor decode.
+     // Interrupt its native read and discard the session after it returns.
+-    if (decodingNeighbor) {
+-      seekEpoch.incrementAndGet()
+-      activeDecoder?.interruptPersistent()
+-      activeBridge?.cancelActivePreviewRequests()
++    // The single decoder must not finish a 3-second obsolete network seek
++    // before it can serve the image currently under the user's finger.
++    // The worker owns close/reopen; only an interrupt is issued here.
++    val running = activeForegroundSlot.get()
++    if (decodingNeighbor || (running >= 0L && running != next)) {
++      invalidateTransport(playbackSeek = false)
+     }
+     foregroundRequests.trySend(next ?: -1L)
+   }
+@@ -185,8 +202,15 @@
+         val slot = withTimeoutOrNull(8_000L) { foregroundRequests.receive() }
+         if (slot == null || slot < 0) {
+           releaseSession()
++          transportInvalidated.set(false)
+           continue
+         }
++        // cancelActivePreviewRequests() closes HTTP admission forever for its
++        // bridge. Reuse would silently cause every subsequent frame to fail.
++        if (transportInvalidated.getAndSet(false)) {
++          releaseSession()
++          Log.d("SeekPreviewPerf", "foreground transport reopened after cancellation")
++        }
+         if (!isStillWanted(slot)) continue
+         val cached = peekNearby(slot)
+         if (cached != null) {
+@@ -201,6 +225,10 @@
+           delay(250)
+         }
+         if (!active() || !isStillWanted(slot)) continue
++        if (transportInvalidated.getAndSet(false)) {
++          releaseSession()
++          Log.d("SeekPreviewPerf", "foreground transport reopened after playback recovery")
++        }
+ 
+         val start = SystemClock.elapsedRealtime()
+         val startedEpoch = seekEpoch.get()
+@@ -218,6 +246,8 @@
+           bridge = runCatching { NetworkSeekHttpBridge.open(source, headers, appCache) }.getOrNull()
+           activeBridge = bridge
+         }
++        if (!isStillWanted(slot) || playbackNeedsPriority() ||
++            seekEpoch.get() != startedEpoch || transportInvalidated.get()) continue
+         val previewUrl: () -> String? = { if (playbackNeedsPriority()) null else bridge?.previewUrl }
+         if (decoder == null && (!networkSource || bridge != null)) {
+           decoder = NetworkSeekFrameRetriever(source, headers, disabledPlatformProbe, previewUrl)
+@@ -225,16 +255,22 @@
+         }
+         // Local files use the existing native extractor. Network video uses
+         // exactly one FFmpeg session against the authenticated preview proxy.
+-        val frame = if (networkSource) {
+-          decoder?.persistentFrameAt(slot)
+-            ?: if (!playbackNeedsPriority() && isStillWanted(slot)) decoder?.nativeFrameAt(slot) { path, second, hw ->
+-              PlaybackSession.grabThumbnailFast(path, second, 512, hw)
+-            } else null
+-        } else {
+-          PlaybackSession.grabThumbnailFast(source, slot / 1000.0, 512, true)
++        activeForegroundSlot.set(slot)
++        val frame = try {
++          if (networkSource) {
++            decoder?.persistentFrameAt(slot)
++              ?: if (!playbackNeedsPriority() && isStillWanted(slot) &&
++                  seekEpoch.get() == startedEpoch && !transportInvalidated.get()) decoder?.nativeFrameAt(slot) { path, second, hw ->
++                PlaybackSession.grabThumbnailFast(path, second, 512, hw)
++              } else null
++          } else {
++            PlaybackSession.grabThumbnailFast(source, slot / 1000.0, 512, true)
++          }
++        } finally {
++          activeForegroundSlot.compareAndSet(slot, -1L)
+         }
+         if (!active() || !isStillWanted(slot) || seekEpoch.get() != startedEpoch) {
+-          if (seekEpoch.get() != startedEpoch) releaseSession()
++          if (seekEpoch.get() != startedEpoch || transportInvalidated.getAndSet(false)) releaseSession()
+           continue
+         }
+         if (frame != null) {
+@@ -252,7 +288,10 @@
+         }
+         // A real seek or a new scrub target can interrupt the preview transport.
+         // Never reuse an interrupted native decoder handle for the next request.
+-        if (playbackNeedsPriority() || seekEpoch.get() != startedEpoch) releaseSession()
++        if (playbackNeedsPriority() || seekEpoch.get() != startedEpoch || transportInvalidated.get()) {
++          releaseSession()
++          transportInvalidated.set(false)
++        }
+       }
+     } catch (_: CancellationException) {
+       // This is normal when the video closes.
+@@ -377,9 +416,10 @@
+ 
+   fun close() {
+     if (!closed.compareAndSet(false, true)) return
+-    activeDecoder?.interruptPersistent()
+-    activeBridge?.cancelActivePreviewRequests()
+-    foregroundRequests.close()
++    invalidateTransport(playbackSeek = true)
++    // Cancelling the scope wakes receive() with CancellationException, which
++    // foregroundLoop already handles. Closing the Channel first instead throws
++    // ClosedReceiveChannelException from this SupervisorJob worker.
+     scope.cancel()
+     memory.evictAll()
+     memoryTimes.clear()

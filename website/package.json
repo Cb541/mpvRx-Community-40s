@@ -1,0 +1,21 @@
+{
+  "name": "mpvrxweb",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "check": "blume check",
+    "validate": "blume validate",
+    "doctor": "blume doctor",
+    "preview": "blume preview"
+  },
+  "dependencies": {
+    "@lucide/astro": "1.42.0",
+    "blume": "1.6.3",
+    "simple-icons": "16.30.0"
+  }
+}

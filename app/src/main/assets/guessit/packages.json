@@ -1,0 +1,24 @@
+{
+  "packages": [
+    {
+      "file": "guessit-4.4.0-py3-none-any.whl",
+      "sha256": "565bf82dd6dc8801f357b2eec6a1dd447007f398dbebd06b7b440e303e2df3bc"
+    },
+    {
+      "file": "rebulk-6.0.1-py3-none-any.whl",
+      "sha256": "fe67fd0af60962c7f3957fa01ef0039c43631c09146228698ee22e20ac33907e"
+    },
+    {
+      "file": "babelfish-0.6.1-py3-none-any.whl",
+      "sha256": "512f1501d4c8f7d38f0921f48660be7542de1a7b24abb6a6a65324a670150293"
+    },
+    {
+      "file": "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+      "sha256": "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427"
+    },
+    {
+      "file": "six-1.17.0-py2.py3-none-any.whl",
+      "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+    }
+  ]
+}
