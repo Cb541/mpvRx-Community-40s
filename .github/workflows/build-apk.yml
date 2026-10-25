@@ -19,7 +19,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: Install project Android SDK components
         run: |
           yes | sdkmanager --licenses > /dev/null || true
